@@ -94,6 +94,8 @@ the database engine, you'll need to run your Docker container slightly different
     </CodeGroup>
 
    <sub>If you run into errors, see the [errors section](#errors) below.</sub>
+   <br />
+   <sub>If you’re installing on Linux and need help, check out this [community provided video walkthrough](https://www.youtube.com/watch?v=WVH7LHqND1I).</sub>
 
 2. Create new project and launch tool
 
@@ -229,9 +231,9 @@ Now inside Mage, you can load or refer to your `credentials.json` file using the
 Alter the Docker command slightly to work for Windows file path syntax:
 
 ```bash
-docker run -it -p 6789:6789
-    -v "C:\Some Path\dragon\secrets\credentials.json":/home/secrets
-    -v "C:\Some Path\To Your Current Directory":/home/src mageai/mageai \
+docker run -it -p 6789:6789 ^
+    -v "C:\Some Path\dragon\secrets\credentials.json":/home/secrets ^
+    -v "C:\Some Path\To Your Current Directory":/home/src mageai/mageai ^
     /app/run_app.sh mage start [project_name]
 ```
 

@@ -197,6 +197,7 @@
             {
               "group": "Destinations",
               "pages": [
+                "guides/streaming/destinations/amazon-s3",
                 "guides/streaming/destinations/kafka",
                 "guides/streaming/destinations/kinesis",
                 "guides/streaming/destinations/opensearch",
@@ -434,6 +435,43 @@
       ]
     },
     {
+      "group": "Contributing",
+      "pages": [
+        {
+          "group": "Backend",
+          "pages": [
+            "contributing/backend/overview",
+            {
+              "group": "API",
+              "pages": [
+                "contributing/backend/api/overview",
+                "contributing/backend/api/resources",
+                "contributing/backend/api/policies",
+                "contributing/backend/api/presenters",
+                {
+                  "group": "Routes",
+                  "pages": [
+                    "contributing/backend/api/sessions",
+                    "contributing/backend/api/pipelines",
+                    "contributing/backend/api/pipeline-schedules",
+                    "contributing/backend/api/pipeline-runs",
+                    "contributing/backend/api/backfills",
+                    "contributing/backend/api/logs"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "group": "Frontend",
+          "pages": [
+            "contributing/frontend/overview"
+          ]
+        }
+      ]
+    },
+    {
       "group": "About",
       "pages": [
         "about/features",
@@ -453,5 +491,8 @@
     "amplitude": {
       "apiKey": "b3c3b09423fea2abaae92c08b44de1c3"
     }
+  },
+  "api": {
+    "hidePlayground": true
   }
 }

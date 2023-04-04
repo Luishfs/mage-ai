@@ -1,0 +1,50 @@
+---
+title: "Contributing to the backend server"
+sidebarTitle: "Overview"
+description: "Guides on adding features to the backend server."
+---
+
+| | |
+| --- | --- |
+| Language | Python |
+| Framework | Tornado |
+| Code directory | `mage_ai/server/` |
+
+## Style guide
+
+### Linter
+Install `flake8` in your IDE to lint the Python code.
+
+To run the linter locally, execute this script:
+
+```bash
+./scripts/server/lint.sh
+```
+
+## Testing
+
+### Unit tests
+
+Add unit tests for the feature in
+[mage_ai/tests](https://github.com/mage-ai/mage-ai/tree/master/mage_ai/tests) directory.
+
+To run the tests locally, execute this script:
+
+```bash
+./scripts/server/test.sh
+```
+
+## Guides
+
+### API
+
+- [Overview](/contributing/backend/api/overview)
+- [Routes](/contributing/backend/api/routes)
+
+### Data integrations
+
+- [Add a new source to data integration pipeline](/data-integrations/sources/add-new-source)
+
+### Streaming pipelines
+
+- [Add a new source or destination to the streaming pipeline](/guides/streaming/contributing)

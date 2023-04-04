@@ -17,6 +17,7 @@ from mage_ai.data_preparation.repo_manager import RepoConfig, get_repo_config, g
 from mage_ai.data_preparation.templates.utils import copy_template_directory
 from mage_ai.data_preparation.variable_manager import VariableManager
 from mage_ai.orchestration.db import db_connection, safe_db_query
+from mage_ai.shared.array import find
 from mage_ai.shared.hash import extract, ignore_keys, merge_dict
 from mage_ai.shared.io import safe_write, safe_write_async
 from mage_ai.shared.strings import format_enum
@@ -24,6 +25,7 @@ from mage_ai.shared.utils import clean_name
 from typing import Callable, Dict, List
 import aiofiles
 import asyncio
+import datetime
 import json
 import os
 import shutil
@@ -46,6 +48,7 @@ class Pipeline:
         self.schedules = []
         self.uuid = uuid
         self.type = PipelineType.PYTHON
+        self.updated_at = datetime.datetime.now()
         self.widget_configs = []
         if config is None:
             self.load_config_from_yaml()
@@ -378,6 +381,7 @@ class Pipeline:
             self.data_integration = catalog
         self.name = config.get('name')
         self.description = config.get('description')
+        self.updated_at = config.get('updated_at')
         self.type = config.get('type') or self.type
 
         self.block_configs = config.get('blocks') or []
@@ -463,6 +467,7 @@ class Pipeline:
             description=self.description,
             name=self.name,
             type=self.type.value if type(self.type) is not str else self.type,
+            updated_at=self.updated_at,
             uuid=self.uuid,
         )
         if self.variables is not None:
@@ -604,7 +609,7 @@ class Pipeline:
         db_connection.session.commit()
 
     async def update(self, data, update_content=False):
-        if 'name' in data and data['name'] != self.name:
+        if 'name' in data and self.name and data['name'] != self.name:
             """
             Rename pipeline folder
             """
@@ -635,6 +640,10 @@ class Pipeline:
             Update kernel
             """
             self.type = data['type']
+            should_save = True
+
+        if 'updated_at' in data and data['updated_at'] != self.updated_at:
+            self.updated_at = data['updated_at']
             should_save = True
 
         if 'data_integration' in data:
@@ -900,7 +909,9 @@ class Pipeline:
                         widget=False,
                     )
                     for b in upstream_blocks_added:
-                        b.downstream_blocks.append(block)
+                        if not find(lambda x: x.uuid == block.uuid, b.downstream_blocks):
+                            b.downstream_blocks.append(block)
+
                     for b in upstream_blocks_removed:
                         b.downstream_blocks = [
                             db for db in b.downstream_blocks if db.uuid != block.uuid
@@ -1077,6 +1088,8 @@ class Pipeline:
         extension_uuid: str = None,
         widget: bool = False,
     ) -> None:
+        blocks_current = sorted([b.uuid for b in self.blocks_by_uuid.values()])
+
         if block_uuid is not None:
             current_pipeline = await Pipeline.get_async(self.uuid, self.repo_path)
             block = self.get_block(block_uuid, extension_uuid=extension_uuid, widget=widget)
@@ -1102,7 +1115,33 @@ class Pipeline:
         if not pipeline_dict:
             raise Exception('Writing empty pipeline metadata is prevented.')
 
+        blocks_updated = sorted([b['uuid'] for b in pipeline_dict.get('blocks', [])])
+
+        if blocks_current != blocks_updated:
+            raise Exception(
+                'Blocks cannot be added or removed when saving content, please try again.',
+            )
+
         content = yaml.dump(pipeline_dict)
+
+        test_path = f'{self.config_path}.test'
+        async with aiofiles.open(test_path, mode='w') as fp:
+            await fp.write(content)
+
+        success = True
+        with open(test_path, mode='r') as fp:
+            try:
+                yaml.full_load(fp)
+            except yaml.scanner.ScannerError:
+                success = False
+
+        try:
+            os.remove(test_path)
+        except Exception as err:
+            print(err)
+
+        if not success:
+            raise Exception('Invalid pipeline metadata.yaml content, please try saving again.')
 
         await safe_write_async(self.config_path, content)
 
