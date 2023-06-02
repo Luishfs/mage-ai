@@ -7,7 +7,7 @@ import BlockType, {
   CONVERTIBLE_BLOCK_TYPES,
   TagEnum,
 } from '@interfaces/BlockType';
-import PipelineType from '@interfaces/PipelineType';
+import PipelineType, { PipelineTypeEnum } from '@interfaces/PipelineType';
 import { FlyoutMenuItemType } from '@oracle/components/FlyoutMenu';
 import { capitalizeRemoveUnderscoreLower, lowercase } from '@utils/string';
 import { goToWithQuery } from '@utils/routing';
@@ -33,12 +33,14 @@ export const getUpstreamBlockUuids = (
 };
 
 export const getDownstreamBlockUuids = (
+  pipeline: PipelineType,
   currentBlock: BlockType,
   newBlock?: BlockRequestPayloadType,
 ): string[] => {
   let downstreamBlocks = [];
 
-  if (!BLOCK_TYPES_WITH_NO_PARENTS.includes(currentBlock?.type)
+  if (pipeline?.type === PipelineTypeEnum.STREAMING
+    && !BLOCK_TYPES_WITH_NO_PARENTS.includes(currentBlock?.type)
     && !BLOCK_TYPES_WITH_NO_PARENTS.includes(newBlock?.type)
   ) {
     downstreamBlocks = downstreamBlocks.concat(currentBlock?.downstream_blocks || []);
@@ -100,6 +102,7 @@ export const getMoreActionsItems = (
   setOutputCollapsed: (outputCollapsed: boolean) => void,
   onlyIncludeDeleteBlock?: boolean,
   opts?: {
+    addNewBlock?: (block: BlockRequestPayloadType) => Promise<any>,
     blocksMapping: {
       [uuid: string]: BlockType;
     };
@@ -121,20 +124,24 @@ export const getMoreActionsItems = (
     downstream_blocks: downstreamBlocks,
     has_callback,
     language,
+    metadata,
+    replicated_block: replicatedBlock,
+    type: blockType,
     upstream_blocks: upstreamBlocks,
+    uuid: blockUUID,
   } = block || {};
   const {
     dynamic,
     reduce_output: reduceOutput,
   } = configuration || {};
-  const isDBT = BlockTypeEnum.DBT === block?.type;
+  const isDBT = BlockTypeEnum.DBT === blockType;
   const items: FlyoutMenuItemType[] = [];
 
   if (![
     BlockTypeEnum.CALLBACK,
     BlockTypeEnum.EXTENSION,
     BlockTypeEnum.MARKDOWN,
-  ].includes(block.type)) {
+  ].includes(blockType)) {
     items.push({
       label: () => isDBT
         ? 'Execute and run upstream blocks'
@@ -152,6 +159,7 @@ export const getMoreActionsItems = (
     }
 
     const {
+      addNewBlock,
       blocksMapping,
       fetchFileTree,
       fetchPipeline,
@@ -174,53 +182,55 @@ export const getMoreActionsItems = (
     });
 
     if (isDBT && BlockLanguageEnum.SQL === language) {
-      items.unshift(...[
-        {
-          label: () => 'Run model',
-          onClick: () => runBlock({
-            block,
-            runSettings: {
-              run_model: true,
-            },
-          }),
-          tooltip: () => 'Execute command dbt run.',
-          uuid: 'run_model',
-        },
-        {
-          label: () => 'Test model',
-          onClick: () => runBlock({
-            block,
-            runSettings: {
-              test_model: true,
-            },
-          }),
-          tooltip: () => 'Execute command dbt test.',
-          uuid: 'test_model',
-        },
-        {
-          label: () => 'Build model',
-          onClick: () => runBlock({
-            block,
-            runSettings: {
-              build_model: true,
-            },
-          }),
-          tooltip: () => 'Execute command dbt build.',
-          uuid: 'build_model',
-        },
-        {
-          label: () => 'Add upstream models',
-          onClick: () => {
-            updatePipeline({
-              pipeline: {
-                add_upstream_for_block_uuid: block?.uuid,
+      if (!metadata?.dbt?.block?.snapshot) {
+        items.unshift(...[
+          {
+            label: () => 'Run model',
+            onClick: () => runBlock({
+              block,
+              runSettings: {
+                run_model: true,
               },
-            });
+            }),
+            tooltip: () => 'Execute command dbt run.',
+            uuid: 'run_model',
           },
-          tooltip: () => 'Add upstream models for this model to the pipeline.',
-          uuid: 'add_upstream_models',
-        },
-      ]);
+          {
+            label: () => 'Test model',
+            onClick: () => runBlock({
+              block,
+              runSettings: {
+                test_model: true,
+              },
+            }),
+            tooltip: () => 'Execute command dbt test.',
+            uuid: 'test_model',
+          },
+          {
+            label: () => 'Build model',
+            onClick: () => runBlock({
+              block,
+              runSettings: {
+                build_model: true,
+              },
+            }),
+            tooltip: () => 'Execute command dbt build.',
+            uuid: 'build_model',
+          },
+          {
+            label: () => 'Add upstream models',
+            onClick: () => {
+              updatePipeline({
+                pipeline: {
+                  add_upstream_for_block_uuid: block?.uuid,
+                },
+              });
+            },
+            tooltip: () => 'Add upstream models for this model to the pipeline.',
+            uuid: 'add_upstream_models',
+          },
+        ]);
+      }
     }
 
     if (!isDBT && savePipelineContent && (dynamic || otherDynamicBlocks.length === 0)) {
@@ -282,6 +292,18 @@ export const getMoreActionsItems = (
       },
       uuid: 'has_callback',
     });
+
+
+    if (!isDBT) {
+      items.push({
+        disabled: !!replicatedBlock,
+        label: () => 'Replicate block',
+        onClick: () => addNewBlock({
+          replicated_block: blockUUID,
+        }),
+        uuid: 'Replicate block',
+      });
+    }
   }
 
   items.push({
@@ -307,7 +329,12 @@ export function buildTags({ tags }: BlockType): {
   const arr = [];
 
   tags?.forEach((tag: TagEnum) => {
-    if (TagEnum.DYNAMIC === tag) {
+    if (TagEnum.DBT_SNAPSHOT === tag) {
+      arr.push({
+        description: 'This is a dbt snapshot file.',
+        title: capitalizeRemoveUnderscoreLower(TagEnum.DBT_SNAPSHOT),
+      });
+    } else if (TagEnum.DYNAMIC === tag) {
       arr.push({
         description: 'This block will create N blocks for each of its downstream blocks.',
         title: capitalizeRemoveUnderscoreLower(TagEnum.DYNAMIC),
@@ -321,6 +348,11 @@ export function buildTags({ tags }: BlockType): {
       arr.push({
         description: 'Reduce output from all dynamically created blocks into a single array output.',
         title: capitalizeRemoveUnderscoreLower(TagEnum.REDUCE_OUTPUT),
+      });
+    } else if (TagEnum.REPLICA === tag) {
+      arr.push({
+        description: 'This block is a replica of another block in the current pipeline.',
+        title: capitalizeRemoveUnderscoreLower(TagEnum.REPLICA),
       });
     } else {
       arr.push({

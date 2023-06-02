@@ -1,18 +1,16 @@
 import { toast } from 'react-toastify';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useMutation } from 'react-query';
 
 import Button from '@oracle/elements/Button';
+import Chip from '@oracle/components/Chip';
 import FlexContainer from '@oracle/components/FlexContainer';
 import Headline from '@oracle/elements/Headline';
+import RoleType from '@interfaces/RoleType';
 import Select from '@oracle/elements/Inputs/Select';
 import Spacing from '@oracle/elements/Spacing';
 import TextInput from '@oracle/elements/Inputs/TextInput';
-import UserType, {
-  ROLE_DISPLAY_MAPPING,
-  ROLES,
-  RoleValueEnum,
-} from '@interfaces/UserType';
+import UserType from '@interfaces/UserType';
 import api from '@api';
 import usePrevious from '@utils/usePrevious';
 import {
@@ -21,12 +19,15 @@ import {
   USER_PROFILE_FIELDS,
   UserFieldType,
 } from './constants';
+import { find, remove } from '@utils/array';
 import { getUser } from '@utils/session';
 import { isEmptyObject, selectKeys } from '@utils/hash';
 import { onSuccess } from '@api/utils/response';
 
 type UserEditFormProps = {
   disabledFields?: string[];
+  entity?: string,
+  entityID?: string,
   hideFields?: string[];
   newUser?: boolean;
   onDeleteSuccess?: () => void;
@@ -38,6 +39,8 @@ type UserEditFormProps = {
 
 function UserEditForm({
   disabledFields,
+  entity = 'global',
+  entityID,
   hideFields: hideFieldsProp,
   newUser,
   onDeleteSuccess,
@@ -52,15 +55,20 @@ function UserEditForm({
   }>({});
   const [profile, setProfile] = useState<UserType>(null);
   const {
-    id: currentUserId,
     owner: isOwner,
-    roles: currentUserRoles,
   } = getUser() || {};
-  const roleOptions = ROLES.filter((role: number) => (
-    (currentUserRoles === RoleValueEnum.ADMIN && currentUserId !== user?.id)
-      ? role > RoleValueEnum.ADMIN
-      : true
-  ));
+
+  const { data: dataRoles, mutate: fetchRoles } = api.roles.list({
+    entity: entity,
+    entity_ids: entityID ? [entityID] : [],
+    limit_roles: !!newUser,
+  }, {
+    revalidateOnFocus: false,
+  });
+  const roles = useMemo(
+    () => dataRoles?.roles || [],
+    [dataRoles?.roles],
+  );
 
   const [updateUser, { isLoading }] = useMutation(
     newUser ? api.users.useCreate() : api.users.useUpdate(user?.id),
@@ -70,11 +78,11 @@ function UserEditForm({
           callback: ({
             user: userServer,
           }) => {
-            const newProfile =
-              // @ts-ignore
-              selectKeys(userServer, USER_PROFILE_FIELDS.concat(USER_PASSWORD_FIELDS).map(({
-                uuid,
-              }) => uuid));
+            // @ts-ignore
+            const keys = USER_PROFILE_FIELDS.concat(USER_PASSWORD_FIELDS).map(({
+              uuid,
+            }) => uuid);
+            const newProfile = selectKeys(userServer, keys);
             setProfile(newProfile);
 
             toast.success(
@@ -136,13 +144,15 @@ function UserEditForm({
   const requirePasswordCurrent = !hideFields
     || !hideFields.includes(USER_PASSWORD_CURRENT_FIELD_UUID);
 
- const userPrev = usePrevious(user);
+  const userPrev = usePrevious(user);
   useEffect(() => {
     if (user && (!profile || userPrev?.id !== user?.id)) {
       // @ts-ignore
-      setProfile(selectKeys(user, USER_PROFILE_FIELDS.concat(USER_PASSWORD_FIELDS).map(({
+      const keys = USER_PROFILE_FIELDS.concat(USER_PASSWORD_FIELDS).map(({
         uuid,
-      }) => uuid)));
+      }) => uuid);
+      // @ts-ignore
+      setProfile(selectKeys(user, keys));
     }
 
     if (profile?.password || profile?.password_confirmation) {
@@ -175,6 +185,22 @@ function UserEditForm({
     user,
     userPrev,
   ]);
+
+  const [rolesUpdated, setRolesUpdated] = useState<boolean>(false);
+  const currentRoles = useMemo(() => {
+    let roles;
+    if (!rolesUpdated) {
+      roles = user?.roles_new;
+    } else {
+      roles = profile?.roles_new;
+    }
+    return roles || [];
+  }, [profile, rolesUpdated, user]);
+
+  const visibleProfileRoles = useMemo(() => {
+    const roleIDs = roles?.map(({ id }: RoleType) => id) || [];
+    return currentRoles?.filter(({ id }: RoleType) => roleIDs.includes(id));
+  }, [currentRoles, roles]);
 
   return (
     <>
@@ -222,43 +248,61 @@ function UserEditForm({
               label="Roles"
               // @ts-ignore
               onChange={e => {
-                setButtonDisabled(false);
-
-                if (e.target.value === RoleValueEnum.OWNER) {
-                  setProfile(prev => ({
-                    ...prev,
-                    owner: true,
-                    roles: null,
-                  }));
-                } else {
-                  const updatedProfile: UserType = {
-                    roles: e.target.value,
-                  };
-                  if (isOwner) {
-                    updatedProfile.owner = false;
-                  }
-                  setProfile(prev => ({
-                    ...prev,
-                    ...updatedProfile,
-                  }));
+                const role = find(roles, (({ id }: RoleType) => id == e.target.value));
+                if (role) {
+                  setButtonDisabled(false);
+                  setRolesUpdated(true);
+                  setProfile(prev => {
+                    let updatedProfile = {};
+                    if (!find(currentRoles, ({ id }: RoleType) => id == role?.id)) {
+                      updatedProfile = {
+                        roles_new: [...currentRoles, role],
+                      };
+                    }
+                    return {
+                      ...prev,
+                      ...updatedProfile,
+                    };
+                  });
                 }
               }}
               primary
               setContentOnMount
-              value={(profile?.owner ? RoleValueEnum.OWNER : profile?.roles)
-                || (user?.roles || '')}
             >
-              {roleOptions.map((value) => (
-                <option key={value} value={value}>
-                  {ROLE_DISPLAY_MAPPING[value]}
+              {roles.map(({ id, name }) => (
+                <option key={name} value={id}>
+                  {name}
                 </option>
               ))}
-              {(!newUser && isOwner) &&
-                <option key="owner_role" value={RoleValueEnum.OWNER}>
-                  {ROLE_DISPLAY_MAPPING[RoleValueEnum.OWNER]}
-                </option>
-              }
             </Select>
+            <Spacing mb={1} />
+            <FlexContainer alignItems="center" flexWrap="wrap">
+              {visibleProfileRoles?.map(({ id, name }: RoleType) => (
+                <Spacing
+                  key={`user_roles/${name}`}
+                  mb={1}
+                  mr={1}
+                >
+                  <Chip
+                    disabled={disabledFields?.includes('roles')}
+                    label={name}
+                    onClick={() => {
+                      setButtonDisabled(false);
+                      setRolesUpdated(true);
+                      setProfile(prev => ({
+                        ...prev,
+                        roles_new: remove(
+                          currentRoles,
+                          ({ id: rid }: RoleType) => rid === id,
+                        ),
+                      }));
+                    }}
+                    primary
+                  />
+                </Spacing>
+              ))}
+            </FlexContainer>
+            
           </Spacing>
         )}
 
@@ -309,8 +353,17 @@ function UserEditForm({
             <Button
               disabled={buttonDisabled || (errors && !isEmptyObject(errors))}
               loading={isLoading}
-              // @ts-ignore
-              onClick={() => updateUser({ user: profile })}
+              onClick={() => {
+                const updated_profile = {
+                  ...profile,
+                };
+                if ('roles_new' in updated_profile) {
+                  // @ts-ignore
+                  updated_profile['roles_new'] = profile.roles_new?.map(({ id }: RoleType) => id);
+                }
+                // @ts-ignore
+                updateUser({ user: updated_profile });
+              }}
               primary
             >
               {newUser ? 'Create new user' : 'Update user profile'}

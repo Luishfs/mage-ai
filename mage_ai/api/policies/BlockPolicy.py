@@ -2,10 +2,17 @@ from mage_ai.api.oauth_scope import OauthScope
 from mage_ai.api.operations import constants
 from mage_ai.api.policies.BasePolicy import BasePolicy
 from mage_ai.api.presenters.BlockPresenter import BlockPresenter
+from mage_ai.orchestration.db.models.oauth import Permission
 
 
 class BlockPolicy(BasePolicy):
-    pass
+    @property
+    def entity(self):
+        parent_model = self.options.get('parent_model')
+        if parent_model:
+            return Permission.Entity.PIPELINE, parent_model.uuid
+
+        return super().entity
 
 
 BlockPolicy.allow_actions([
@@ -59,6 +66,7 @@ BlockPolicy.allow_write([
     'metadata',
     'name',
     'priority',
+    'replicated_block',
     'type',
     'upstream_blocks',
     'uuid',
@@ -85,6 +93,8 @@ BlockPolicy.allow_write([
     'metadata',
     'name',
     'outputs',
+    'replicated_block',
+    'retry_config',
     'status',
     'tags',
     'tap_stream_id',

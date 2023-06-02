@@ -1,14 +1,17 @@
+import os
+import shutil
+import sys
+import traceback
 from enum import Enum
+from typing import Dict
+
+import ruamel.yaml
+import yaml
 from jinja2 import Template
+
 from mage_ai.data_preparation.shared.constants import REPO_PATH_ENV_VAR
 from mage_ai.data_preparation.templates.utils import copy_template_directory
 from mage_ai.shared.environments import is_test
-from typing import Dict
-import os
-import ruamel.yaml
-import sys
-import traceback
-import yaml
 
 MAGE_DATA_DIR_ENV_VAR = 'MAGE_DATA_DIR'
 if is_test():
@@ -70,15 +73,21 @@ class RepoConfig:
             self.project_type = repo_config.get('project_type')
             self.cluster_type = repo_config.get('cluster_type')
             self.remote_variables_dir = repo_config.get('remote_variables_dir')
+
+            # Executor configs
+            self.azure_container_instance_config = \
+                repo_config.get('azure_container_instance_config')
             self.ecs_config = repo_config.get('ecs_config')
             self.emr_config = repo_config.get('emr_config')
             self.gcp_cloud_run_config = repo_config.get('gcp_cloud_run_config')
             self.k8s_executor_config = repo_config.get('k8s_executor_config')
+            self.spark_config = repo_config.get('spark_config')
+
             self.notification_config = repo_config.get('notification_config', dict())
             self.queue_config = repo_config.get('queue_config', dict())
             self.project_uuid = repo_config.get('project_uuid')
             self.help_improve_mage = repo_config.get('help_improve_mage')
-            self.spark_config = repo_config.get('spark_config')
+            self.retry_config = repo_config.get('retry_config')
 
             self.s3_bucket = None
             self.s3_path_prefix = None
@@ -108,6 +117,7 @@ class RepoConfig:
     def to_dict(self, remote: bool = False) -> Dict:
         return dict(
             project_type=self.project_type,
+            azure_container_instance_config=self.azure_container_instance_config,
             ecs_config=self.ecs_config,
             emr_config=self.emr_config,
             gcp_cloud_run_config=self.gcp_cloud_run_config,
@@ -151,6 +161,20 @@ def init_repo(repo_path: str, project_type: str = ProjectType.STANDALONE) -> Non
 
     if project_type == ProjectType.MAIN:
         copy_template_directory('main', repo_path)
+    elif project_type == ProjectType.SUB:
+        os.makedirs(
+            os.getenv(MAGE_DATA_DIR_ENV_VAR) or DEFAULT_MAGE_DATA_DIR,
+            exist_ok=True,
+        )
+        copy_template_directory('repo', repo_path)
+        new_repo_config = get_repo_config(repo_path)
+        current_metadata = get_repo_config().metadata_path
+        new_metadata = new_repo_config.metadata_path
+        if os.path.exists(current_metadata):
+            shutil.copyfile(current_metadata, new_metadata)
+        new_repo_config.save(
+            project_type=ProjectType.SUB.value,
+        )
     else:
         os.makedirs(
             os.getenv(MAGE_DATA_DIR_ENV_VAR) or DEFAULT_MAGE_DATA_DIR,

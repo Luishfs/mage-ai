@@ -48,8 +48,15 @@ def parse_attributes(block) -> Dict:
 
     file_path = configuration['file_path']
     path_parts = file_path.split(os.sep)
-    project_name = path_parts[0]
+    project_folder_name = path_parts[0]
     filename = path_parts[-1]
+
+    first_folder_name = None
+    if len(path_parts) >= 3:
+        # e.g. demo_project/models/users.sql will be
+        # ['demo_project', 'models', 'users.sql']
+        first_folder_name = path_parts[1]
+
     model_name = None
     file_extension = None
 
@@ -67,7 +74,16 @@ def parse_attributes(block) -> Dict:
 
     full_path = os.path.join(get_repo_path(), 'dbt', file_path)
 
-    project_full_path = os.path.join(get_repo_path(), 'dbt', project_name)
+    project_full_path = os.path.join(get_repo_path(), 'dbt', project_folder_name)
+    dbt_project_full_path = os.path.join(project_full_path, 'dbt_project.yml')
+
+    dbt_project = None
+    project_name = project_folder_name
+    profile_name = project_folder_name
+    with open(dbt_project_full_path, 'r') as f:
+        dbt_project = yaml.safe_load(f)
+        project_name = dbt_project.get('name') or project_folder_name
+        profile_name = dbt_project.get('profile') or project_name
 
     models_folder_path = os.path.join(project_full_path, 'models')
     sources_full_path = os.path.join(models_folder_path, 'mage_sources.yml')
@@ -75,9 +91,7 @@ def parse_attributes(block) -> Dict:
 
     profiles_full_path = os.path.join(project_full_path, PROFILES_FILE_NAME)
     profile_target = configuration.get('dbt_profile_target')
-    profile = load_profile(project_name, profiles_full_path, profile_target)
-
-    dbt_project_full_path = os.path.join(project_full_path, 'dbt_project.yml')
+    profile = load_profile(profile_name, profiles_full_path, profile_target)
 
     source_name = f'mage_{project_name}'
     if profile:
@@ -88,21 +102,34 @@ def parse_attributes(block) -> Dict:
                 DataSource.SPARK == profile.get('type')):
             source_name = profile['schema']
 
+    file_path_with_project_name = os.path.join(project_name, *path_parts[1:])
+
+    snapshot_paths = dbt_project.get('snapshot-paths', [])
+    snapshot = first_folder_name and first_folder_name in snapshot_paths
+
     return dict(
+        dbt_project=dbt_project,
         dbt_project_full_path=dbt_project_full_path,
         file_extension=file_extension,
         file_path=file_path,
+        file_path_with_project_name=file_path_with_project_name,
         filename=filename,
+        first_folder_name=first_folder_name,
         full_path=full_path,
         model_name=model_name,
         models_folder_path=models_folder_path,
+        profile=profile,
+        profile_name=profile_name,
         profiles_full_path=profiles_full_path,
+        project_folder_name=project_folder_name,
         project_full_path=project_full_path,
         project_name=project_name,
+        snapshot=snapshot,
         source_name=source_name,
         sources_full_path=sources_full_path,
         sources_full_path_legacy=sources_full_path_legacy,
         table_name=table_name,
+        target_path=dbt_project.get('target-path', 'target'),
     )
 
 
@@ -356,33 +383,33 @@ async def load_profiles_file_async(profiles_full_path: str) -> Dict:
         return {}
 
 
-def load_profiles(project_name: str, profiles_full_path: str) -> Dict:
+def load_profiles(profile_name: str, profiles_full_path: str) -> Dict:
     profiles = load_profiles_file(profiles_full_path)
 
-    if not profiles or project_name not in profiles:
-        print(f'Project name {project_name} does not exist in profile file {profiles_full_path}.')
+    if not profiles or profile_name not in profiles:
+        print(f'Project name {profile_name} does not exist in profile file {profiles_full_path}.')
         return {}
 
-    return profiles[project_name]
+    return profiles[profile_name]
 
 
-async def load_profiles_async(project_name: str, profiles_full_path: str) -> Dict:
+async def load_profiles_async(profile_name: str, profiles_full_path: str) -> Dict:
     profiles = await load_profiles_file_async(profiles_full_path)
 
-    if not profiles or project_name not in profiles:
-        print(f'Project name {project_name} does not exist in profile file {profiles_full_path}.')
+    if not profiles or profile_name not in profiles:
+        print(f'Project name {profile_name} does not exist in profile file {profiles_full_path}.')
         return {}
 
-    return profiles[project_name]
+    return profiles[profile_name]
 
 
 def load_profile(
-    project_name: str,
+    profile_name: str,
     profiles_full_path: str,
     profile_target: str = None,
 ) -> Dict:
 
-    profile = load_profiles(project_name, profiles_full_path)
+    profile = load_profiles(profile_name, profiles_full_path)
     outputs = profile.get('outputs', {})
     target = profile.get('target', None)
 
@@ -391,10 +418,10 @@ def load_profile(
 
 def get_profile(block, profile_target: str = None) -> Dict:
     attr = parse_attributes(block)
-    project_name = attr['project_name']
+    profile_name = attr['profile_name']
     profiles_full_path = attr['profiles_full_path']
 
-    return load_profile(project_name, profiles_full_path, profile_target)
+    return load_profile(profile_name, profiles_full_path, profile_target)
 
 
 def config_file_loader_and_configuration(block, profile_target: str) -> Dict:
@@ -799,18 +826,28 @@ def interpolate_refs_with_table_names(
     )
 
 
-def compiled_query_string(block: Block) -> str:
+def compiled_query_string(block: Block, error_if_not_found: bool = False) -> str:
     attr = parse_attributes(block)
 
+    file_path_with_project_name = attr['file_path_with_project_name']
     project_full_path = attr['project_full_path']
-    file_path = attr['file_path']
+    target_path = attr['target_path']
+    snapshot = attr['snapshot']
 
-    file = os.path.join(project_full_path, 'target', 'compiled', file_path)
+    folder_name = 'run' if snapshot else 'compiled'
+    file_path = os.path.join(
+        project_full_path,
+        target_path,
+        folder_name,
+        file_path_with_project_name,
+    )
 
-    if not os.path.exists(file):
+    if not os.path.exists(file_path):
+        if error_if_not_found:
+            raise Exception(f'Compiled SQL query file at {file_path} not found.')
         return None
 
-    with open(file, 'r') as f:
+    with open(file_path, 'r') as f:
         query_string = f.read()
 
         # TODO (tommy dang): this was needed because we didn’t want to create model tables and
@@ -886,7 +923,7 @@ def execute_query(
 
 
 def query_from_compiled_sql(block, profile_target: str, limit: int = None) -> DataFrame:
-    query_string = compiled_query_string(block)
+    query_string = compiled_query_string(block, error_if_not_found=True)
 
     return execute_query(block, profile_target, query_string, limit)
 
@@ -913,28 +950,7 @@ def build_command_line_arguments(
         elif run_settings.get('test_model'):
             dbt_command = 'test'
 
-    variables_json = {}
-    for k, v in variables.items():
-        if PIPELINE_RUN_MAGE_VARIABLES_KEY == k:
-            continue
-
-        if (type(v) is str or
-                type(v) is int or
-                type(v) is bool or
-                type(v) is float or
-                type(v) is dict or
-                type(v) is list or
-                type(v) is datetime):
-            variables_json[k] = v
-
-    args = [
-        '--vars',
-        simplejson.dumps(
-            variables_json,
-            default=encode_complex,
-            ignore_nan=True,
-        ),
-    ]
+    args = []
 
     runtime_configuration = variables.get(
         PIPELINE_RUN_MAGE_VARIABLES_KEY,
@@ -950,21 +966,26 @@ def build_command_line_arguments(
 
     if BlockLanguage.SQL == block.language:
         attr = parse_attributes(block)
-        project_name = attr['project_name']
+
         file_path = attr['file_path']
-        project_full_path = attr['project_full_path']
         full_path = attr['full_path']
+        project_full_path = attr['project_full_path']
+        project_name = attr['project_name']
+        snapshot = attr['snapshot']
+        target_path = attr['target_path']
+
         path_to_model = full_path.replace(f'{project_full_path}{os.sep}', '')
 
-        if test_execution:
+        if snapshot:
+            dbt_command = 'snapshot'
+        elif test_execution:
             dbt_command = 'compile'
 
-            with open(os.path.join(project_full_path, 'dbt_project.yml')) as f:
-                dbt_project = yaml.safe_load(f)
-                target_path = dbt_project['target-path']
-                path = os.path.join(project_full_path, target_path, 'compiled', file_path)
-                if os.path.exists(path):
-                    os.remove(path)
+            # Remove previously compiled SQL so that the upcoming compile command creates a fresh
+            # compiled SQL file.
+            path = os.path.join(project_full_path, target_path, 'compiled', file_path)
+            if os.path.exists(path):
+                os.remove(path)
 
         if runtime_configuration:
             prefix = runtime_configuration.get('prefix')
@@ -985,7 +1006,80 @@ def build_command_line_arguments(
             **get_template_vars(),
         )
         project_full_path = os.path.join(get_repo_path(), 'dbt', project_name)
-        args += block.content.split(' ')
+        content_args = block.content.split(' ')
+        try:
+            vars_start_idx = content_args.index('--vars')
+            vars_parts = []
+            vars_end_idx = vars_start_idx + 2
+            # Include variables if they have spaces in the object
+            for i in range(vars_start_idx, len(content_args)):
+                current_item = content_args[i]
+                if i > vars_start_idx and current_item.startswith('--'):
+                    """
+                    Stop including parts of the variables object (e.g. {"key": "value"}
+                    is split into ['{"key":', '"value"}']. The variables object can have
+                    many parts.) when next command line arg is reached. If there is not a
+                    next command line argument (such as "--exclude"), then the remaining
+                    items should belong to the variables object.
+                    """
+                    vars_end_idx = i
+                    break
+                elif current_item != ('--vars'):
+                    vars_parts.append(content_args[i])
+                    vars_end_idx = i + 1
+
+            vars_str = ''.join(vars_parts)
+            interpolated_vars = re.findall(r'\{\{(.*?)\}\}', vars_str)
+            for v in interpolated_vars:
+                val = variables.get(v.strip())
+                variable_with_brackets = '{{' + v + '}}'
+                """
+                Replace the variables in the command with the JSON-supported values
+                from the global/environment variables.
+                """
+                if val is not None:
+                    vars_str = vars_str.replace(variable_with_brackets, simplejson.dumps(val))
+                else:
+                    vars_str = vars_str.replace(
+                        variable_with_brackets,
+                        simplejson.dumps(variable_with_brackets),
+                    )
+
+            # Remove trailing single quotes to form proper json
+            if vars_str.startswith("'") and vars_str.endswith("'"):
+                vars_str = vars_str[1:-1]
+            # Variables object needs to be formatted as JSON
+            vars_dict = simplejson.loads(vars_str)
+            variables = merge_dict(variables, vars_dict)
+            del content_args[vars_start_idx:vars_end_idx]
+        except ValueError:
+            # If args do not contain "--vars", continue.
+            pass
+
+        args += content_args
+
+    variables_json = {}
+    for k, v in variables.items():
+        if PIPELINE_RUN_MAGE_VARIABLES_KEY == k:
+            continue
+
+        if (type(v) is str or
+                type(v) is int or
+                type(v) is bool or
+                type(v) is float or
+                type(v) is dict or
+                type(v) is list or
+                type(v) is datetime):
+            variables_json[k] = v
+
+    args += [
+        '--vars',
+        simplejson.dumps(
+            variables_json,
+            default=encode_complex,
+            ignore_nan=True,
+        ),
+    ]
 
     profiles_dir = os.path.join(project_full_path, '.mage_temp_profiles', str(uuid.uuid4()))
 
@@ -1036,6 +1130,12 @@ def run_dbt_tests(
     logger: Logger = None,
     logging_tags: Dict = dict(),
 ) -> None:
+    if block.configuration.get('file_path') is not None:
+        attributes_dict = parse_attributes(block)
+        snapshot = attributes_dict['snapshot']
+        if snapshot:
+            return
+
     if logger is not None:
         stdout = StreamToLogger(logger, logging_tags=logging_tags)
     elif build_block_output_stdout:
@@ -1082,19 +1182,8 @@ def run_dbt_tests(
         raise Exception('DBT test failed.')
 
 
-def get_dbt_project_settings(block: 'Block') -> Dict:
-    attributes_dict = parse_attributes(block)
-    dbt_project_full_path = attributes_dict['dbt_project_full_path']
-
-    config = {}
-    with open(dbt_project_full_path, 'r') as f:
-        config = yaml.safe_load(f)
-
-    return config
-
-
 def get_model_configurations_from_dbt_project_settings(block: 'Block') -> Dict:
-    dbt_project = get_dbt_project_settings(block)
+    dbt_project = parse_attributes(block)['dbt_project']
 
     if not dbt_project.get('models'):
         return

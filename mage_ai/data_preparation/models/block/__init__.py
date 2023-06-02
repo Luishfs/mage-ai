@@ -47,10 +47,12 @@ from mage_ai.data_preparation.models.constants import (
 )
 from mage_ai.data_preparation.models.file import File
 from mage_ai.data_preparation.models.variable import VariableType
-from mage_ai.data_preparation.repo_manager import RepoConfig, get_repo_path
+from mage_ai.data_preparation.repo_manager import get_repo_path
 from mage_ai.data_preparation.shared.stream import StreamToLogger
 from mage_ai.data_preparation.templates.template import load_template
 from mage_ai.server.kernel_output_parser import DataType
+from mage_ai.services.spark.config import SparkConfig
+from mage_ai.services.spark.spark import get_spark_session
 from mage_ai.shared.constants import ENV_DEV, ENV_TEST
 from mage_ai.shared.environments import get_env
 from mage_ai.shared.hash import merge_dict
@@ -226,6 +228,8 @@ class Block:
         extension_uuid: str = None,
         status: BlockStatus = BlockStatus.NOT_EXECUTED,
         pipeline=None,
+        replicated_block: str = None,
+        retry_config: Dict = None,
         language: BlockLanguage = BlockLanguage.PYTHON,
         configuration: Dict = None,
         has_callback: bool = False,
@@ -245,6 +249,7 @@ class Block:
         self.color = block_color
         self.configuration = configuration
         self.has_callback = has_callback
+        self.retry_config = retry_config
 
         self._outputs = None
         self._outputs_loaded = False
@@ -263,6 +268,9 @@ class Block:
         self.spark = None
         self.spark_init = False
 
+        # Replicate block
+        self.replicated_block = replicated_block
+
     @property
     def uuid(self) -> str:
         return self.dynamic_block_uuid or self._uuid
@@ -274,8 +282,17 @@ class Block:
 
     @property
     def content(self) -> str:
+        if self.replicated_block:
+            self._content = Block(
+                self.replicated_block,
+                self.replicated_block,
+                self.type,
+                language=self.language,
+            ).content
+
         if self._content is None:
             self._content = self.file.content()
+
         return self._content
 
     @property
@@ -454,6 +471,7 @@ class Block:
         language=None,
         pipeline=None,
         priority=None,
+        replicated_block: str = None,
         upstream_block_uuids=None,
         config=None,
         widget=False,
@@ -470,7 +488,10 @@ class Block:
         uuid = clean_name(name)
         language = language or BlockLanguage.PYTHON
 
-        if BlockType.DBT != block_type or BlockLanguage.YAML == language:
+        # Don’t create a file if block is replicated from another block
+        if not replicated_block and \
+                (BlockType.DBT != block_type or BlockLanguage.YAML == language):
+
             block_directory = f'{block_type}s' if block_type != BlockType.CUSTOM else block_type
             block_dir_path = os.path.join(repo_path, block_directory)
             if not os.path.exists(block_dir_path):
@@ -505,6 +526,7 @@ class Block:
             extension_uuid=extension_uuid,
             language=language,
             pipeline=pipeline,
+            replicated_block=replicated_block,
         )
 
         if BlockType.DBT == block.type:
@@ -564,7 +586,16 @@ class Block:
         )
 
     def all_upstream_blocks_completed(self, completed_block_uuids: Set[str]) -> bool:
-        return all(b.uuid in completed_block_uuids for b in self.upstream_blocks)
+        arr = []
+        for b in self.upstream_blocks:
+            uuid = b.uuid
+            # Replicated block’s have a block_run block_uuid value with this convention:
+            # [block_uuid]:[replicated_block_uuid]
+            if b.replicated_block:
+                uuid = f'{uuid}:{b.replicated_block}'
+            arr.append(uuid)
+
+        return all(uuid in completed_block_uuids for uuid in arr)
 
     def delete(
         self,
@@ -914,34 +945,37 @@ class Block:
         else:
             stdout = sys.stdout
 
-        # Fetch input variables
-        input_vars, kwargs_vars, upstream_block_uuids = self.fetch_input_variables(
-            input_args,
-            execution_partition,
-            global_vars,
-            dynamic_block_index=dynamic_block_index,
-            dynamic_upstream_block_uuids=dynamic_upstream_block_uuids,
-        )
-
-        outputs_from_input_vars = {}
-        if input_args is None:
-            upstream_block_uuids_length = len(upstream_block_uuids)
-            for idx, input_var in enumerate(input_vars):
-                if idx < upstream_block_uuids_length:
-                    upstream_block_uuid = upstream_block_uuids[idx]
-                    outputs_from_input_vars[upstream_block_uuid] = input_var
-                    outputs_from_input_vars[f'df_{idx + 1}'] = input_var
-        else:
-            outputs_from_input_vars = dict()
-
         with redirect_stdout(stdout):
+            # Fetch input variables
+            input_vars, kwargs_vars, upstream_block_uuids = self.fetch_input_variables(
+                input_args,
+                execution_partition,
+                global_vars,
+                dynamic_block_index=dynamic_block_index,
+                dynamic_upstream_block_uuids=dynamic_upstream_block_uuids,
+            )
+
+            outputs_from_input_vars = {}
+            if input_args is None:
+                upstream_block_uuids_length = len(upstream_block_uuids)
+                for idx, input_var in enumerate(input_vars):
+                    if idx < upstream_block_uuids_length:
+                        upstream_block_uuid = upstream_block_uuids[idx]
+                        outputs_from_input_vars[upstream_block_uuid] = input_var
+                        outputs_from_input_vars[f'df_{idx + 1}'] = input_var
+            else:
+                outputs_from_input_vars = dict()
+
             global_vars_copy = global_vars.copy()
             for kwargs_var in kwargs_vars:
-                global_vars_copy.update(kwargs_var)
+                if kwargs_var:
+                    global_vars_copy.update(kwargs_var)
 
             outputs = self._execute_block(
                 outputs_from_input_vars,
                 custom_code=custom_code,
+                dynamic_block_index=dynamic_block_index,
+                dynamic_upstream_block_uuids=dynamic_upstream_block_uuids,
                 execution_partition=execution_partition,
                 input_vars=input_vars,
                 logger=logger,
@@ -963,6 +997,8 @@ class Block:
         self,
         outputs_from_input_vars,
         custom_code: str = None,
+        dynamic_block_index: int = None,
+        dynamic_upstream_block_uuids: List[str] = None,
         execution_partition: str = None,
         input_vars: List = None,
         logger: Logger = None,
@@ -987,7 +1023,7 @@ class Block:
         }
         results.update(outputs_from_input_vars)
 
-        if custom_code is not None:
+        if custom_code is not None and custom_code.strip():
             if BlockType.CHART != self.type or (not self.group_by_columns or not self.metrics):
                 exec(custom_code, results)
         elif self.content is not None:
@@ -1355,6 +1391,7 @@ df = get_variable('{self.pipeline.uuid}', '{block_uuid}', 'df')
             has_callback=self.has_callback,
             name=self.name,
             language=language,
+            retry_config=self.retry_config,
             status=format_enum(self.status) if self.status else None,
             type=format_enum(self.type) if self.type else None,
             upstream_blocks=self.upstream_block_uuids,
@@ -1363,6 +1400,9 @@ df = get_variable('{self.pipeline.uuid}', '{block_uuid}', 'df')
 
         if include_callback_blocks:
             data['callback_blocks'] = self.callback_block_uuids
+
+        if self.replicated_block:
+            data['replicated_block'] = self.replicated_block
 
         return data
 
@@ -1381,9 +1421,11 @@ df = get_variable('{self.pipeline.uuid}', '{block_uuid}', 'df')
             data['content'] = self.content
             if self.callback_block is not None:
                 data['callback_content'] = self.callback_block.content
+
         if include_outputs:
             data['outputs'] = self.outputs
-            if check_if_file_exists:
+
+            if check_if_file_exists and not self.replicated_block:
                 file_path = self.file.file_path
                 if not os.path.isfile(file_path):
                     data['error'] = dict(
@@ -1398,7 +1440,7 @@ df = get_variable('{self.pipeline.uuid}', '{block_uuid}', 'df')
     async def to_dict_async(
         self,
         include_block_metadata: bool = False,
-        inclide_block_tags: bool = False,
+        include_block_tags: bool = False,
         include_callback_blocks: bool = False,
         include_content: bool = False,
         include_outputs: bool = False,
@@ -1414,7 +1456,8 @@ df = get_variable('{self.pipeline.uuid}', '{block_uuid}', 'df')
 
         if include_outputs:
             data['outputs'] = await self.outputs_async()
-            if check_if_file_exists:
+
+            if check_if_file_exists and not self.replicated_block:
                 file_path = self.file.file_path
                 if not os.path.isfile(file_path):
                     data['error'] = dict(
@@ -1427,7 +1470,7 @@ df = get_variable('{self.pipeline.uuid}', '{block_uuid}', 'df')
         if include_block_metadata:
             data['metadata'] = await self.metadata_async()
 
-        if inclide_block_tags:
+        if include_block_tags:
             data['tags'] = self.tags()
 
         return data
@@ -1527,7 +1570,7 @@ df = get_variable('{self.pipeline.uuid}', '{block_uuid}', 'df')
                     visited.add(block)
         return list(visited)
 
-    def run_upstream_blocks(self) -> None:
+    def run_upstream_blocks(self, **kwargs) -> None:
         def process_upstream_block(
             block: 'Block',
             root_blocks: List['Block'],
@@ -1542,7 +1585,11 @@ df = get_variable('{self.pipeline.uuid}', '{block_uuid}', 'df')
             map(lambda x: process_upstream_block(x, root_blocks), upstream_blocks)
         )
 
-        run_blocks_sync(root_blocks, selected_blocks=upstream_block_uuids)
+        run_blocks_sync(
+            root_blocks,
+            selected_blocks=upstream_block_uuids,
+            **kwargs,
+        )
 
     def run_tests(
         self,
@@ -1786,35 +1833,9 @@ df = get_variable('{self.pipeline.uuid}', '{block_uuid}', 'df')
         if self.spark_init:
             return self.spark
         try:
-            from pyspark.conf import SparkConf
-            from pyspark.sql import SparkSession
-
-            repo_config = RepoConfig(repo_path=self.repo_path)
-            spark_config = repo_config.spark_config
-
-            if spark_config:
-                conf = SparkConf()
-                if spark_config.get('app_name'):
-                    conf.setAppName(spark_config.get('app_name'))
-                if spark_config.get('spark_master'):
-                    conf.setMaster(spark_config.get('spark_master'))
-                if spark_config.get('spark_home'):
-                    conf.setSparkHome(spark_config.get('spark_home'))
-                if spark_config.get('executor_env'):
-                    list_kv_pairs = []
-                    for key, value in spark_config.get('executor_env').items():
-                        list_kv_pairs.append((key, value))
-                    conf.setExecutorEnv(key=None, value=None, pairs=list_kv_pairs)
-                if spark_config.get('spark_jars'):
-                    conf.set('spark.jars', ','.join(spark_config.get('spark_jars')))
-                if spark_config.get('others'):
-                    conf.setAll(spark_config.get('others'))
-
-                self.spark = SparkSession.builder.config(
-                    conf=conf).getOrCreate()
-            else:
-                self.spark = SparkSession.builder.master(
-                    os.getenv('SPARK_MASTER_HOST', 'local')).getOrCreate()
+            spark_config = SparkConfig.load(
+                config={'repo_path': self.repo_path})
+            self.spark = get_spark_session(spark_config)
         except Exception:
             self.spark = None
 
@@ -1999,6 +2020,7 @@ df = get_variable('{self.pipeline.uuid}', '{block_uuid}', 'df')
             TAG_DYNAMIC,
             TAG_DYNAMIC_CHILD,
             TAG_REDUCE_OUTPUT,
+            TAG_REPLICA,
         )
 
         arr = []
@@ -2011,6 +2033,9 @@ df = get_variable('{self.pipeline.uuid}', '{block_uuid}', 'df')
 
         if should_reduce_output(self):
             arr.append(TAG_REDUCE_OUTPUT)
+
+        if self.replicated_block:
+            arr.append(TAG_REPLICA)
 
         return arr
 

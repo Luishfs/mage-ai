@@ -136,7 +136,7 @@ import { useKeyboardContext } from '@context/Keyboard';
 export const DEFAULT_SQL_CONFIG_KEY_LIMIT = 1000;
 
 type CodeBlockProps = {
-  addNewBlock?: (block: BlockType, downstreamBlocks?: string[]) => Promise<any>;
+  addNewBlock?: (block: BlockType, downstreamBlocks?: BlockType[]) => Promise<any>;
   addNewBlockMenuOpenIdx?: number;
   allBlocks: BlockType[];
   allowCodeBlockShortcuts?: boolean;
@@ -248,6 +248,7 @@ function CodeBlock({
     error: blockError,
     has_callback: hasCallback,
     language: blockLanguage,
+    replicated_block: replicatedBlockUUID,
     type: blockType,
     upstream_blocks: blockUpstreamBlocks = [],
     uuid: blockUUID,
@@ -301,7 +302,7 @@ function CodeBlock({
   const [runEndTime, setRunEndTime] = useState<number>(null);
   const [runStartTime, setRunStartTime] = useState<number>(null);
   const [messages, setMessages] = useState<KernelOutputType[]>(blockMessages);
-  const [selectedTab, setSelectedTab] = useState<TabType>(TABS_DBT[0]);
+  const [selectedTab, setSelectedTab] = useState<TabType>(TABS_DBT(block)[0]);
 
   const [collected, drag] = useDrag(() => ({
     collect: (monitor) => ({
@@ -730,7 +731,13 @@ function CodeBlock({
     savePipelineContent,
   ]);
 
-  const codeEditorEl = useMemo(() => (
+  const replicatedBlock =
+    useMemo(() => replicatedBlockUUID && blocksMapping?.[replicatedBlockUUID], [
+      blocksMapping,
+      replicatedBlockUUID,
+    ]);
+
+  const codeEditorEl = useMemo(() => !replicatedBlockUUID && (
     <>
       <CodeEditor
         autoHeight
@@ -816,6 +823,7 @@ function CodeBlock({
     onCallbackChange,
     onChange,
     onDidChangeCursorPosition,
+    replicatedBlockUUID,
     runBlockAndTrack,
     selected,
     setContent,
@@ -853,7 +861,7 @@ function CodeBlock({
           }}
           selectedTabUUID={selectedTab?.uuid}
           small
-          tabs={TABS_DBT}
+          tabs={TABS_DBT(block)}
         />
       </Spacing>
     )
@@ -1440,7 +1448,7 @@ function CodeBlock({
                       </FlexContainer>
                     </Flex>
 
-                    {BlockLanguageEnum.YAML !== blockLanguage && (
+                    {BlockLanguageEnum.YAML !== blockLanguage && !dbtMetadata?.block?.snapshot && (
                       <FlexContainer alignItems="center">
                         <Tooltip
                           appearBefore
@@ -1892,6 +1900,7 @@ function CodeBlock({
                 && !codeCollapsed
                 && BLOCK_TYPES_WITH_UPSTREAM_INPUTS.includes(blockType)
                 && !isStreamingPipeline
+                && !replicatedBlockUUID
                 && (
                 <CodeHelperStyle normalPadding>
                   <Spacing mr={1}>
@@ -2001,7 +2010,37 @@ function CodeBlock({
                 <>
                   {!codeCollapsed
                     ? (!(isMarkdown && !isEditingBlock)
-                      ? codeEditorEl
+                      ? replicatedBlock
+                        ? (<Spacing px={1}>
+                          <Text monospace muted>
+                            Replicated from block <Link
+                              color={getColorsForBlockType(
+                                replicatedBlock?.type,
+                                { blockColor: replicatedBlock?.color, theme: themeContext },
+                              ).accent}
+                              onClick={(e) => {
+                                pauseEvent(e);
+
+                                const refBlock =
+                                  blockRefs?.current?.[`${replicatedBlock?.type}s/${replicatedBlock?.uuid}.py`];
+                                refBlock?.current?.scrollIntoView();
+                              }}
+                              preventDefault
+                            >
+                              <Text
+                                color={getColorsForBlockType(
+                                  replicatedBlock?.type,
+                                  { blockColor: replicatedBlock?.color, theme: themeContext },
+                                ).accent}
+                                inline
+                                monospace
+                              >
+                                {replicatedBlock?.uuid}
+                              </Text>
+                            </Link>
+                          </Text>
+                        </Spacing>)
+                        : codeEditorEl
                       : markdownEl
                     )
                     : (
@@ -2070,7 +2109,17 @@ function CodeBlock({
                     let content = newBlock.content;
                     let configuration = newBlock.configuration;
                     const upstreamBlocks = getUpstreamBlockUuids(block, newBlock);
-                    const downstreamBlocks = getDownstreamBlockUuids(block, newBlock);
+                    const downstreamBlockUUIDs = getDownstreamBlockUuids(pipeline, block, newBlock);
+                    const downstreamBlocks = downstreamBlockUUIDs.map(uuid => {
+                      const currDownstreamBlock = { ...(blocksMapping[uuid] || {}) };
+                      const upstreamsOfDownstreamBlock = currDownstreamBlock.upstream_blocks;
+                      if (upstreamsOfDownstreamBlock) {
+                        currDownstreamBlock.upstream_blocks = upstreamsOfDownstreamBlock.filter(
+                          upstreamUUID => upstreamUUID !== blockUUID,
+                        );
+                      }
+                      return currDownstreamBlock;
+                    });
 
                     if ([BlockTypeEnum.DATA_LOADER, BlockTypeEnum.TRANSFORMER].includes(blockType)
                       && BlockTypeEnum.SCRATCHPAD === newBlock.type
