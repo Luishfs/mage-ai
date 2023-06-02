@@ -23,7 +23,7 @@ from mage_ai.data_preparation.repo_manager import (
 from mage_ai.data_preparation.shared.constants import MANAGE_ENV_VAR
 from mage_ai.orchestration.db import db_connection
 from mage_ai.orchestration.db.database_manager import database_manager
-from mage_ai.orchestration.db.models.oauth import Oauth2Application, User
+from mage_ai.orchestration.db.models.oauth import Oauth2Application, Role, User
 from mage_ai.server.active_kernel import switch_active_kernel
 from mage_ai.server.api.base import BaseHandler
 from mage_ai.server.api.blocks import ApiPipelineBlockAnalysisHandler
@@ -64,6 +64,7 @@ from mage_ai.settings import (
     SHELL_COMMAND,
     USE_UNIQUE_TERMINAL,
 )
+from mage_ai.shared.constants import InstanceType
 from mage_ai.shared.logger import LoggingLevel
 from mage_ai.shared.utils import is_port_in_use
 from mage_ai.usage_statistics.logger import UsageStatisticLogger
@@ -215,12 +216,20 @@ async def main(
         # We need to sleep for a few seconds after creating all the tables or else there
         # may be an error trying to create users.
         sleep(3)
-        user = User.query.filter(User.owner == True).first()  # noqa: E712
-        if not user:
+
+        # Create new roles on existing users. This should only need to be run once.
+        Role.create_default_roles()
+
+        # Fetch legacy owner user to check if we need to batch update the users with new roles.
+        legacy_owner_user = User.query.filter(User._owner == True).first()  # noqa: E712
+
+        default_owner_role = Role.get_role('Owner')
+        owner_users = default_owner_role.users if default_owner_role else []
+        if not legacy_owner_user and len(owner_users) == 0:
             print('User with owner permission doesn’t exist, creating owner user.')
             if AUTHENTICATION_MODE.lower() == 'ldap':
                 user = User.create(
-                    owner=True,
+                    roles_new=[default_owner_role],
                     username=LDAP_ADMIN_USERNAME,
                 )
             else:
@@ -229,9 +238,14 @@ async def main(
                     email='admin@admin.com',
                     password_hash=create_bcrypt_hash('admin', password_salt),
                     password_salt=password_salt,
-                    owner=True,
+                    roles_new=[default_owner_role],
                     username='admin',
                 )
+            owner_user = user
+        else:
+            if legacy_owner_user and not legacy_owner_user.roles_new:
+                User.batch_update_user_roles()
+            owner_user = next(iter(owner_users), None) or legacy_owner_user
 
         oauth_client = Oauth2Application.query.filter(
             Oauth2Application.client_id == OAUTH2_APPLICATION_CLIENT_ID,
@@ -242,7 +256,7 @@ async def main(
                 client_id=OAUTH2_APPLICATION_CLIENT_ID,
                 client_type=Oauth2Application.ClientType.PUBLIC,
                 name='frontend',
-                user_id=user.id,
+                user_id=owner_user.id,
             )
 
     # Check scheduler status periodically
@@ -267,6 +281,7 @@ def start_server(
     project: str = None,
     manage: bool = False,
     dbt_docs: bool = False,
+    instance_type: InstanceType = InstanceType.SERVER_AND_SCHEDULER,
 ):
     host = host if host else None
     port = port if port else DATA_PREP_SERVER_PORT
@@ -287,6 +302,7 @@ def start_server(
     if dbt_docs:
         run_docs_server()
     else:
+        run_web_server = True
         project_type = get_project_type()
         if manage or project_type == ProjectType.MAIN:
             os.environ[MANAGE_ENV_VAR] = '1'
@@ -295,22 +311,33 @@ def start_server(
                 database_manager.run_migrations()
             except Exception:
                 traceback.print_exc()
-        else:
+        elif instance_type == InstanceType.SERVER_AND_SCHEDULER:
             # Start a subprocess for scheduler
             scheduler_manager.start_scheduler()
+        elif instance_type == InstanceType.SCHEDULER:
+            # Start a subprocess for scheduler
+            scheduler_manager.start_scheduler(foreground=True)
+            run_web_server = False
+        elif instance_type == InstanceType.WEB_SERVER:
+            # run migrations to enable user authentication
+            try:
+                database_manager.run_migrations()
+            except Exception:
+                traceback.print_exc()
 
-        if LoggingLevel.is_valid_level(SERVER_VERBOSITY):
-            options.logging = SERVER_VERBOSITY
-        enable_pretty_logging()
+        if run_web_server:
+            if LoggingLevel.is_valid_level(SERVER_VERBOSITY):
+                options.logging = SERVER_VERBOSITY
+            enable_pretty_logging()
 
-        # Start web server
-        asyncio.run(
-            main(
-                host=host,
-                port=port,
-                project=project,
+            # Start web server
+            asyncio.run(
+                main(
+                    host=host,
+                    port=port,
+                    project=project,
+                )
             )
-        )
 
 
 if __name__ == '__main__':
@@ -320,6 +347,7 @@ if __name__ == '__main__':
     parser.add_argument('--project', type=str, default=None)
     parser.add_argument('--manage-instance', type=str, default='0')
     parser.add_argument('--dbt-docs-instance', type=str, default='0')
+    parser.add_argument('--instance-type', type=str, default='server_and_scheduler')
     args = parser.parse_args()
 
     host = args.host
@@ -327,6 +355,7 @@ if __name__ == '__main__':
     project = args.project
     manage = args.manage_instance == '1'
     dbt_docs = args.dbt_docs_instance == '1'
+    instance_type = args.instance_type
 
     start_server(
         host=host,
@@ -334,4 +363,5 @@ if __name__ == '__main__':
         project=project,
         manage=manage,
         dbt_docs=dbt_docs,
+        instance_type=instance_type,
     )

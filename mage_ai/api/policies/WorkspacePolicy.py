@@ -2,10 +2,13 @@ from mage_ai.api.oauth_scope import OauthScope
 from mage_ai.api.operations import constants
 from mage_ai.api.policies.BasePolicy import BasePolicy
 from mage_ai.api.presenters.WorkspacePresenter import WorkspacePresenter
+from mage_ai.orchestration.db.models.oauth import Permission
 
 
 class WorkspacePolicy(BasePolicy):
-    pass
+    @property
+    def entity(self):
+        return Permission.Entity.GLOBAL, None
 
 
 WorkspacePolicy.allow_actions([
@@ -62,6 +65,7 @@ WorkspacePolicy.allow_write([
 
 WorkspacePolicy.allow_query([
     'cluster_type',
+    'user_id',
 ], scopes=[
     OauthScope.CLIENT_PRIVATE,
 ], on_action=[

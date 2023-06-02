@@ -1,19 +1,21 @@
-from mage_ai.data_preparation.preferences import get_preferences
-from mage_ai.data_preparation.repo_manager import get_repo_path
-from mage_ai.data_preparation.shared.secrets import get_secret_value
-from mage_ai.data_preparation.sync import AuthType, GitConfig
-from mage_ai.orchestration.db.models.oauth import User
-from mage_ai.shared.logger import VerboseFunctionExec
-from typing import Any, List
-from urllib.parse import urlparse, urlsplit, urlunsplit
 import asyncio
 import base64
 import os
 import shutil
 import subprocess
 import uuid
+from typing import Any, List
+from urllib.parse import urlparse, urlsplit, urlunsplit
+
+from mage_ai.data_preparation.preferences import get_preferences
+from mage_ai.data_preparation.repo_manager import get_repo_path
+from mage_ai.data_preparation.shared.secrets import get_secret_value
+from mage_ai.data_preparation.sync import AuthType, GitConfig
+from mage_ai.orchestration.db.models.oauth import User
+from mage_ai.shared.logger import VerboseFunctionExec
 
 DEFAULT_SSH_KEY_DIRECTORY = os.path.expanduser('~/.ssh')
+DEFAULT_KNOWN_HOSTS_FILE = os.path.join(DEFAULT_SSH_KEY_DIRECTORY, 'known_hosts')
 REMOTE_NAME = 'mage-repo'
 
 # Git authentication variables
@@ -78,7 +80,8 @@ class Git:
 
     def untracked_files(self, untracked_files: bool = False) -> List[str]:
         from git.compat import defenc
-        # Taken from GitPython source code
+
+        # ---------- Taken from GitPython source code -----------
         proc = self.repo.git.status(
             as_process=True,
             porcelain=True,
@@ -105,6 +108,7 @@ class Git:
                 )
             untracked_files.append(filename)
         proc.wait()
+        # -------------------------------------------------------
         return untracked_files
 
     @property
@@ -113,26 +117,11 @@ class Git:
 
     async def check_connection(self) -> None:
         proc = self.repo.git.ls_remote(self.origin.name, as_process=True)
-        ct = 0
-        while ct < 20:
-            return_code = proc.poll()
-            if return_code is not None:
-                proc.kill()
-                break
-            ct += 1
-            await asyncio.sleep(0.5)
 
-        if return_code is not None and return_code != 0:
-            _, err = proc.communicate()
-            message = (
-                err.decode('UTF-8') if err
-                else 'Error connecting to remote, make sure your SSH key is set up properly.'
-            )
-            raise ChildProcessError(message)
-
-        if return_code is None:
-            proc.kill()
-            raise TimeoutError
+        self.__poll_process_with_timeout(
+            proc,
+            error_message='Error connecting to remote, make sure your SSH key is set up properly.',
+        )
 
     def _run_command(self, command: str) -> None:
         proc = subprocess.Popen(args=command, shell=True)
@@ -155,6 +144,8 @@ class Git:
                 private_key_file = self.__create_ssh_keys()
                 git_ssh_cmd = f'ssh -i {private_key_file}'
                 with self.repo.git.custom_environment(GIT_SSH_COMMAND=git_ssh_cmd):
+                    if not os.path.exists(DEFAULT_KNOWN_HOSTS_FILE):
+                        self.__add_host_to_known_hosts()
                     try:
                         asyncio.run(self.check_connection())
                     except ChildProcessError as err:
@@ -336,14 +327,23 @@ class Git:
             if self.auth_type == AuthType.SSH:
                 private_key_file = self.__create_ssh_keys()
                 env = {'GIT_SSH_COMMAND': f'ssh -i {private_key_file}'}
-                self.__add_host_to_known_hosts()
+                if not self.__add_host_to_known_hosts():
+                    raise Exception('Could not add host to known_hosts')
             repo_git = git.cmd.Git(self.repo_path)
             repo_git.update_environment(**env)
-            repo_git.clone(
+            proc = repo_git.clone(
                 self.remote_repo_link,
                 tmp_path,
                 origin=REMOTE_NAME,
-                kill_after_timeout=30,
+                as_process=True,
+            )
+
+            asyncio.run(
+                self.__poll_process_with_timeout(
+                    proc,
+                    error_message='Error cloning repo.',
+                    timeout=20,
+                )
             )
 
             git_folder = os.path.join(self.repo_path, '.git')
@@ -361,5 +361,37 @@ class Git:
         url = f'ssh://{self.git_config.remote_repo_link}'
         hostname = urlparse(url).hostname
         if hostname:
-            cmd = f'ssh-keyscan -t rsa {hostname} >> ~/.ssh/known_hosts'
+            cmd = f'ssh-keyscan -t rsa {hostname} >> {DEFAULT_KNOWN_HOSTS_FILE}'
             self._run_command(cmd)
+            return True
+        return False
+
+    async def __poll_process_with_timeout(
+        self,
+        proc: subprocess.Popen,
+        error_message: str = None,
+        timeout: int = 10,
+    ):
+        ct = 0
+        while ct < timeout * 2:
+            return_code = proc.poll()
+            if return_code is not None:
+                proc.kill()
+                break
+            ct += 1
+            await asyncio.sleep(0.5)
+
+        if error_message is None:
+            error_message = 'Error running Git process'
+
+        if return_code is not None and return_code != 0:
+            _, err = proc.communicate()
+            message = (
+                err.decode('UTF-8') if err
+                else error_message
+            )
+            raise ChildProcessError(message)
+
+        if return_code is None:
+            proc.kill()
+            raise TimeoutError
