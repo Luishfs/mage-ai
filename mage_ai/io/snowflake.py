@@ -178,9 +178,9 @@ class Snowflake(BaseSQLConnection):
 
         if not table_name and not full_table_name:
             # Try to find table name via query
-            table_name = table_name_parts_from_query(query_string)
-            if table_name is not None:
-                table_name = table_name[2]
+            table_name_parts = table_name_parts_from_query(query_string)
+            if table_name_parts is not None:
+                table_name = table_name_parts[2]
 
         with self.printer.print_msg(print_message):
             with self.conn.cursor() as cur:
