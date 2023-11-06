@@ -5,6 +5,7 @@ import singer.utils as singer_utils
 from requests.exceptions import RequestException
 from singer import SingerSyncError, Transformer, metadata, metrics
 
+from mage_integrations.sources.base import write_state
 from mage_integrations.sources.salesforce.client.tap_salesforce.salesforce.bulk import (
     Bulk,
 )
@@ -13,10 +14,8 @@ LOGGER = singer.get_logger()
 
 BLACKLISTED_FIELDS = set(['attributes'])
 
-
 def remove_blacklisted_fields(data):
     return {k: v for k, v in data.items() if k not in BLACKLISTED_FIELDS}
-
 
 # pylint: disable=unused-argument
 def transform_bulk_data_hook(data, typ, schema):
@@ -38,7 +37,6 @@ def transform_bulk_data_hook(data, typ, schema):
 
     return result
 
-
 def get_stream_version(catalog_entry, state):
     tap_stream_id = catalog_entry['tap_stream_id']
     catalog_metadata = metadata.to_map(catalog_entry['metadata'])
@@ -53,14 +51,9 @@ def get_stream_version(catalog_entry, state):
         return stream_version
     return int(time.time() * 1000)
 
-
 def resume_syncing_bulk_query(sf, catalog_entry, job_id, state, counter):
     bulk = Bulk(sf)
-    current_bookmark = singer.get_bookmark(state, catalog_entry['tap_stream_id'],
-                                           'JobHighestBookmarkSeen') or sf.get_start_date(
-                                                                                    state,
-                                                                                    catalog_entry
-                                                                                         )
+    current_bookmark = singer.get_bookmark(state, catalog_entry['tap_stream_id'], 'JobHighestBookmarkSeen') or sf.get_start_date(state, catalog_entry)
     current_bookmark = singer_utils.strptime_with_tz(current_bookmark)
     batch_ids = singer.get_bookmark(state, catalog_entry['tap_stream_id'], 'BatchIDs')
 
@@ -73,8 +66,7 @@ def resume_syncing_bulk_query(sf, catalog_entry, job_id, state, counter):
     schema = catalog_entry['schema']
 
     if not bulk.job_exists(job_id):
-        LOGGER.info("Found stored Job ID that no longer exists," +
-                    "resetting bookmark and removing JobID from state.")
+        LOGGER.info("Found stored Job ID that no longer exists, resetting bookmark and removing JobID from state.")
         return counter
 
     # Iterate over the remaining batches, removing them once they are synced
@@ -93,10 +85,8 @@ def resume_syncing_bulk_query(sf, catalog_entry, job_id, state, counter):
                         time_extracted=start_time))
 
                 # Update bookmark if necessary
-                replication_key_value = replication_key and singer_utils.strptime_with_tz(
-                                                                                rec[replication_key]
-                                                                                         )
-                if replication_key_value and replication_key_value <= start_time and replication_key_value > current_bookmark: # noqa
+                replication_key_value = replication_key and singer_utils.strptime_with_tz(rec[replication_key])
+                if replication_key_value and replication_key_value <= start_time and replication_key_value > current_bookmark:
                     current_bookmark = singer_utils.strptime_with_tz(rec[replication_key])
 
         state = singer.write_bookmark(state,
@@ -106,10 +96,9 @@ def resume_syncing_bulk_query(sf, catalog_entry, job_id, state, counter):
         batch_ids.remove(batch_id)
         LOGGER.info("Finished syncing batch %s. Removing batch from state.", batch_id)
         LOGGER.info("Batches to go: %d", len(batch_ids))
-        singer.write_state(state)
+        write_state(state)
 
     return counter
-
 
 def sync_stream(sf, catalog_entry, state):
     stream = catalog_entry['stream']
@@ -117,22 +106,19 @@ def sync_stream(sf, catalog_entry, state):
     with metrics.record_counter(stream) as counter:
         try:
             sync_records(sf, catalog_entry, state, counter)
-            singer.write_state(state)
+            write_state(state)
         except RequestException as ex:
             raise Exception("{} Response: {}, (Stream: {})".format(
                 ex, ex.response.text, stream)) from ex
         except Exception as ex:
             if "OPERATION_TOO_LARGE: exceeded 100000 distinct who/what's" in str(ex):
                 raise SingerSyncError("OPERATION_TOO_LARGE: exceeded 100000 distinct who/what's. " +
-                                      "Consider asking your Salesforce System Administrator" +
-                                      "to provide you with the " +
-                                      "`View All Data` profile permission." +
-                                      "(Stream: {})".format(stream)) from ex
+                                      "Consider asking your Salesforce System Administrator to provide you with the " +
+                                      "`View All Data` profile permission. (Stream: {})".format(stream)) from ex
             raise Exception("{}, (Stream: {})".format(
                 ex, stream)) from ex
 
         return counter
-
 
 def sync_records(sf, catalog_entry, state, counter):
     chunked_bookmark = singer_utils.strptime_with_tz(sf.get_start_date(state, catalog_entry))
@@ -162,20 +148,18 @@ def sync_records(sf, catalog_entry, state, counter):
                 version=stream_version,
                 time_extracted=start_time))
 
-        replication_key_value = replication_key and singer_utils.strptime_with_tz(
-                                                                                rec[replication_key]
-                                                                                 )
+        replication_key_value = replication_key and singer_utils.strptime_with_tz(rec[replication_key])
 
         if sf.pk_chunking:
-            if replication_key_value and replication_key_value <= start_time and replication_key_value > chunked_bookmark: # noqa
-                # Replace the highest seen bookmark and save the state in case we need later
+            if replication_key_value and replication_key_value <= start_time and replication_key_value > chunked_bookmark:
+                # Replace the highest seen bookmark and save the state in case we need to resume later
                 chunked_bookmark = singer_utils.strptime_with_tz(rec[replication_key])
                 state = singer.write_bookmark(
                     state,
                     catalog_entry['tap_stream_id'],
                     'JobHighestBookmarkSeen',
                     singer_utils.strftime(chunked_bookmark))
-                singer.write_state(state)
+                write_state(state)
         # Before writing a bookmark, make sure Salesforce has not given us a
         # record with one outside our range
         elif replication_key_value and replication_key_value <= start_time:
@@ -184,7 +168,7 @@ def sync_records(sf, catalog_entry, state, counter):
                 catalog_entry['tap_stream_id'],
                 replication_key,
                 rec[replication_key])
-            singer.write_state(state)
+            write_state(state)
 
         # Tables with no replication_key will send an
         # activate_version message for the next sync
@@ -193,8 +177,7 @@ def sync_records(sf, catalog_entry, state, counter):
         state = singer.write_bookmark(
             state, catalog_entry['tap_stream_id'], 'version', None)
 
-    # If pk_chunking is set, and selected streams has replication key then only write a bookmark
-    # at the end
+    # If pk_chunking is set, and selected streams has replication key then only write a bookmark at the end
     if sf.pk_chunking and replication_key:
         # Write a bookmark with the highest value we've seen
         state = singer.write_bookmark(
@@ -202,7 +185,6 @@ def sync_records(sf, catalog_entry, state, counter):
             catalog_entry['tap_stream_id'],
             replication_key,
             singer_utils.strftime(chunked_bookmark))
-
 
 def fix_record_anytype(rec, schema):
     """Modifies a record when the schema has no 'type' element due to a SF type of 'anyType.'
