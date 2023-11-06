@@ -55,18 +55,20 @@ class Salesforce(Source):
         do_sync(
             self.client,
             catalog_dict,
-            state,
+            self.state,
             logger=self.logger
         )
 
     def discover(self, streams: List[str] = None) -> Catalog:
         try:
             if streams:
+                self.logger.info("IF STREAMS")
                 return Catalog(
                     do_discover(self.client, streams=streams, logger=self.logger)['streams'])
         finally:
             self.__finally_clean_up()
 
+        self.logger.info('NOT STREAMS')
         return Catalog([])
 
     def get_stream_ids(self) -> List[str]:
